@@ -129,6 +129,53 @@
     background:var(--blood-tint);
   }
 
+  .error-overlay{
+    position:fixed;
+    inset:0;
+    background:rgba(22,27,34,.35);
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    z-index:2000;
+    padding:20px;
+  }
+  .error-popup{
+    background:#fff;
+    border:1px solid var(--line);
+    border-top:4px solid var(--blood);
+    border-radius:var(--radius);
+    box-shadow:0 12px 32px rgba(22,27,34,.28);
+    width:100%;
+    max-width:340px;
+    padding:16px 18px 18px;
+  }
+  .error-popup-head{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    font-family:var(--mono);
+    font-weight:600;
+    font-size:13px;
+    color:var(--blood-deep);
+    margin-bottom:8px;
+  }
+  .error-close{
+    border:none;
+    background:none;
+    font-size:20px;
+    line-height:1;
+    color:var(--ink-soft);
+    cursor:pointer;
+    padding:0 2px;
+  }
+  .error-close:hover{ color:var(--ink); }
+  .error-popup p{
+    margin:0;
+    font-size:13.5px;
+    color:var(--ink);
+    line-height:1.5;
+  }
+
   .right-col{
     display:flex;
     flex-direction:column;
@@ -278,11 +325,17 @@
     gap:12px;
   }
 
-  .leaflet-popup-content{
+  .leaflet-popup-content, .hotspot-tooltip{
     font-family:var(--sans);
     font-size:12.5px;
     line-height:1.55;
     min-width:190px;
+  }
+  .hotspot-tooltip{
+    box-shadow:0 4px 14px rgba(22,27,34,.18);
+    border:1px solid var(--line);
+    border-radius:8px;
+    padding:10px 12px;
   }
   .popup-title{
     font-family:var(--mono);
@@ -327,9 +380,6 @@
         <span class="count">{{ lastResultCount }} site(s) affiché(s)</span>
       </div>
       <div id="map"></div>
-      <div class="map-status" :class="{error: messageErreur}">
-        {{ messageErreur || statutTexte }}
-      </div>
     </section>
 
     <!-- COLONNE DROITE -->
@@ -412,6 +462,17 @@
 
     </section>
   </div>
+
+  <!-- POPUP D'ERREUR -->
+  <div class="error-overlay" v-if="messageErreur" @click.self="messageErreur = ''">
+    <div class="error-popup">
+      <div class="error-popup-head">
+        <span>Aucun résultat</span>
+        <button class="error-close" @click="messageErreur = ''" aria-label="Fermer">×</button>
+      </div>
+      <p>{{ messageErreur }}</p>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -446,6 +507,7 @@ createApp({
     // Le modificcateur générale s'applique au nombre total de poches
     // ---------------------------------------------------------------
     const scenarios = {
+      'Aucun':                             { rare:  0, generale:  0 },
       'Pandémie':                          { rare:-40, generale: 20 },
       'Catastrophe phase aigüe':           { rare: 40, generale: 20 },
       'Catastrophe « worse case »':        { rare:-40, generale:-60 },
@@ -483,7 +545,7 @@ createApp({
       abo: '',
       date: new Date().toISOString().slice(0,10),
       heure: plagesHoraires[0],
-      scenario: 'Autre',
+      scenario: 'Aucun',
       descriptionScenario: '',
       messageErreur: '',
       statutTexte: 'En attente d\'une recherche…',
@@ -499,7 +561,7 @@ createApp({
         referrerPolicy: 'origin',
         maxZoom: 18
       }).addTo(map);
-      heatLayer = L.heatLayer([], { radius: 45, blur: 35, maxZoom: 15 }).addTo(map);
+      heatLayer = L.heatLayer([], { radius: 34, blur: 26, maxZoom: 15 }).addTo(map);
       markersLayer = L.layerGroup().addTo(map);
     });
 
@@ -532,8 +594,15 @@ createApp({
       return a;
     }
 
-    function jitter(lat, lng){
-      return [lat + (Math.random() - 0.5) * 0.006, lng + (Math.random() - 0.5) * 0.006];
+    // Jitter gaussien (Box-Muller) : les points se concentrent près du centre
+    // et s'estompent vers l'extérieur -> blob dense, sans trou au milieu
+    function jitterDense(lat, lng, ecart){
+      const u1 = Math.random() || 1e-9;
+      const u2 = Math.random();
+      const r = Math.sqrt(-2 * Math.log(u1));
+      const a1 = r * Math.cos(2 * Math.PI * u2) * ecart;
+      const a2 = r * Math.sin(2 * Math.PI * u2) * ecart;
+      return [lat + a1, lng + a2];
     }
 
     function formatDateFr(iso){
@@ -541,7 +610,7 @@ createApp({
       return d.toLocaleDateString('fr-CH', { weekday:'long', day:'2-digit', month:'long', year:'numeric' });
     }
 
-    // Vide la carte puis dessine les résultats fournis (heat + marqueurs + popups).
+    // Vide la carte puis dessine les résultats fournis (heat dense + info au survol).
     // `resultats` : [{ site, totalAffiche, valeurAffichee, labelValeur, labelTotal }]
     function dessinerResultats(resultats, messageAucunResultat, statutSiOk){
       heatLayer.setLatLngs([]);
@@ -562,31 +631,37 @@ createApp({
         const ratio = r.valeurAffichee / r.totalAffiche;
         const intensite = maxRatio > 0 ? Math.max(0.25, ratio / maxRatio) : 0.5;
 
-        for (let i = 0; i < 22; i++){
-          const [lat, lng] = jitter(r.site.lat, r.site.lng);
+        // point plein au centre + nuage gaussien dense autour -> pas d'espace vide
+        points.push([r.site.lat, r.site.lng, intensite]);
+        for (let i = 0; i < 45; i++){
+          const [lat, lng] = jitterDense(r.site.lat, r.site.lng, 0.0013);
           points.push([lat, lng, intensite]);
         }
 
-        const marker = L.circleMarker([r.site.lat, r.site.lng], {
-          radius: 7,
-          color: '#7d1a2f',
-          weight: 2,
-          fillColor: '#a3233d',
-          fillOpacity: 0.9
+        // zone invisible mais interactive, superposée à la heatmap, pour que
+        // le survol déclenche l'info-bulle sur toute la surface du hotspot.
+        // circleMarker (rayon en pixels écran) au lieu de circle (rayon en
+        // mètres) pour rester calé sur le heatLayer (aussi en pixels) à
+        // n'importe quel niveau de zoom.
+        const zone = L.circleMarker([r.site.lat, r.site.lng], {
+          radius: 34 + intensite * 22,
+          stroke: false,
+          fillOpacity: 0,
+          interactive: true
         }).addTo(markersLayer);
 
-        marker.bindPopup(`
+        zone.bindTooltip(`
           <div class="popup-title">${r.site.nom}</div>
           <div class="popup-row"><span class="k">Date</span><span class="v">${formatDateFr(state.date)}</span></div>
           <div class="popup-row"><span class="k">Plage horaire</span><span class="v">${state.heure}</span></div>
           <div class="popup-row"><span class="k">${r.labelValeur}</span><span class="v">${r.valeurAffichee}</span></div>
           <div class="popup-row"><span class="k">${r.labelTotal}</span><span class="v">${r.totalAffiche}</span></div>
-        `);
+        `, { sticky: true, direction: 'top', opacity: 0.97, className: 'hotspot-tooltip' });
       });
 
       heatLayer.setLatLngs(points);
-      const bounds = L.latLngBounds(resultats.map(r => [r.site.lat, r.site.lng]));
-      map.fitBounds(bounds.pad(0.4));
+      // la carte ne se recadre plus automatiquement — le zoom/déplacement
+      // reste entièrement sous le contrôle de l'utilisateur
 
       state.lastResultCount = resultats.length;
       state.statutTexte = statutSiOk;
